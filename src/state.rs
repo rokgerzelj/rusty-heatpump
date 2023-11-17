@@ -56,7 +56,6 @@ pub struct SensorState {
     pub linkquality: u8,
     pub temperature: f64,
     pub voltage: u16,
-    last_seen: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -93,7 +92,6 @@ pub struct ThermostatState {
     window_open_external: bool,
     window_open_feature: bool,
     window_open_internal: String,
-    last_seen: String,
 }
 
 impl ThermostatState {
