@@ -133,6 +133,9 @@ async fn main() {
                             }
                         }
 
+                        // some form of compressor cycling protection has to be enabled
+                        // in order for this feature to not cause issues
+                        // currently we rely on param 2841 to be set to 'yes' on the siemens RVS HP controller
                         if !heat_required {
                             // if we want to stop heat generation
                             adjustment = -40.0;
