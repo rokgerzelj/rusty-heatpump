@@ -122,9 +122,11 @@ async fn main() {
                         let setpoint = thermostat_state.occupied_heating_setpoint;
 
                         let mut adjustment = 0.0;
-                        if heating_demand > 0.8 {
+                        let demand_threshold = 0.75;
+                        if heating_demand > demand_threshold {
                             // positive if we need to heat up
-                            adjustment = (setpoint - sensor_temp) * heating_demand;
+                            adjustment = (setpoint - sensor_temp)
+                                * ((heating_demand - demand_threshold) / (1.0 - demand_threshold));
                             if adjustment < 0.0 {
                                 adjustment = 0.0;
                             }
