@@ -1,191 +1,141 @@
-mod state;
+mod config;
+mod tracker {
+    pub mod device_state;
+    pub mod sensor_state;
+    pub mod thermostat_state;
+}
+mod util;
+mod mqtt {
+    pub mod client;
+}
 
-use rumqttc::{AsyncClient, MqttOptions, QoS};
-use serde_json::json;
-use state::{Config, Room, Sensor, StateTracker, TRVTempControl, Thermostat};
+use config::Config;
+use mqtt::client::{MqttClient, MqttMessage};
+use serde_json::Error;
+use sqlx::sqlite::SqlitePool;
+use tracing::{error, info};
+use tracing_subscriber;
+use tracker::{
+    device_state::DeviceState,
+    sensor_state::SensorState,
+    thermostat_state::{self, ThermostatState},
+};
+
+enum ParseMessageError {
+    JsonError(serde_json::Error),
+    UnrecognizableDeviceId,
+    UnrecognizableTopicName,
+}
+
+// fn parse_message(msg: MqttMessage, config: &Config) -> Result<DeviceState, ParseMessageError> {
+//     let device_id: Vec<&str> = msg.topic.split('/').collect();
+//     if device_id.len() == 2 {
+//         let id = device_id[1].to_string();
+
+//         if config.sensor_ids().contains(&id) {
+//             let sensor_state: SensorState = serde_json::from(&msg.payload)?;
+//             Ok(DeviceState::SensorState(sensor_state))
+//         } else if config.thermostat_ids().contains(&id) {
+//             let thermostat_state: ThermostatState = serde_json::from_str(&msg.payload)?;
+//             Ok(DeviceState::ThermostatState(thermostat_state))
+//         } else {
+//             info!("received unrecognizable device id");
+//             Err(ParseMessageError::UnrecognizableDeviceId)
+//         }
+//     } else {
+//         info!("received unrecognizable topic name");
+//         Err(ParseMessageError::UnrecognizableTopicName)
+//     }
+// }
 
 #[tokio::main]
 async fn main() {
-    let config = Config {
-        rooms: vec![Room {
-            name: "Kopalnica".to_string(),
-            sensor: Sensor {
-                device_id: "0xa4c1385a6271b083".to_string(),
-            },
-            thermostat: Thermostat {
-                device_id: "0x3410f4fffe617bcc".to_string(),
-            },
-            load_balancing: false,
-            trv_temp_control: TRVTempControl::ExternalSensor,
-        }],
-    };
+    tracing_subscriber::fmt::init();
 
-    let mqtt_options = MqttOptions::new("rust_client", "192.168.0.40", 1883)
-        .set_max_packet_size(5 * 1024 * 1024, 5 * 1024 * 1024)
-        .to_owned();
+    let config_str = util::read_file_to_string("config.yaml").await.unwrap();
+    let config = Config::parse(config_str).unwrap();
 
-    let (client, mut event_loop) = AsyncClient::new(mqtt_options, 50);
+    let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+
+    let mqtt_app = MqttClient::new(config.mqtt_host.clone(), config.mqtt_port.clone());
+
+    let (_, mut rx, mqtt_client) = mqtt_app.run();
 
     for id in config.sensor_ids() {
-        client
-            .subscribe(&format!("zigbee2mqtt/{}", id), QoS::AtLeastOnce)
+        mqtt_client
+            .subscribe(&format!("zigbee2mqtt/{}", id), rumqttc::QoS::AtLeastOnce)
             .await
             .unwrap();
     }
 
     for id in config.thermostat_ids() {
-        client
-            .subscribe(&format!("zigbee2mqtt/{}", id), QoS::AtLeastOnce)
+        mqtt_client
+            .subscribe(&format!("zigbee2mqtt/{}", id), rumqttc::QoS::AtLeastOnce)
             .await
             .unwrap();
     }
 
-    let state_tracker = StateTracker::new(config);
-
-    // TODO: try to "poke" the thermostats (and maybe sensors??) to get the state on startup
-
-    tokio::spawn({
-        let client = client.clone();
-        let state_tracker = state_tracker.clone();
-
-        async move {
-            loop {
-                // TODO: ensure states are recent and not stale, needs a state received_at timestamp.
-
-                // !ORDER IMPORTANT! so we don't lock the state_tracker for the sleep duration
-                tokio::time::sleep(tokio::time::Duration::from_secs(60 * 5)).await;
-                let state_reader = state_tracker.read().await;
-
-                for room in state_reader.config.rooms.iter() {
-                    let reader = state_tracker.read().await;
-                    let sensor_state = reader.get_recent_sensor_state(&room.sensor.device_id);
-
-                    if let Some(sensor_state) = sensor_state {
-                        let setting = json!({
-                            "external_measured_room_sensor": (sensor_state.temperature * 100.0) as i32
-                        });
-
-                        client
-                            .publish(
-                                "zigbee2mqtt/".to_owned()
-                                    + &room.thermostat.device_id.clone()
-                                    + "/set",
-                                QoS::AtLeastOnce,
-                                false,
-                                setting.to_string(),
-                            )
-                            .await
-                            .unwrap();
-
-                        println!(
-                            "Setting external_measured_room_sensor for {} to {}",
-                            room.name, sensor_state.temperature
-                        );
-                    } else {
-                        println!(
-                            "Missing recent sensor state for room {}, external_measured_room_sensor will not be set",
-                            room.name
-                        );
-                    }
-                }
-            }
-        }
-    });
-
-    tokio::spawn({
-        let client = client.clone();
-        let state_tracker = state_tracker.clone();
-
-        async move {
-            loop {
-                {
-                    let state_reader = state_tracker.read().await;
-                    state_reader.print_states();
-                }
-
-                // !ORDER IMPORTANT! so we don't lock the state_tracker for the sleep duration
-                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-                let state_reader = state_tracker.read().await;
-
-                // loop over rooms and check if we need to turn on/off the heating
-                for room in state_reader.config.rooms.iter() {
-                    let sensor_state = state_reader.get_recent_sensor_state(&room.sensor.device_id);
-                    let thermostat_state =
-                        state_reader.get_recent_thermostat_state(&room.thermostat.device_id);
-
-                    if let (Some(sensor_state), Some(thermostat_state)) =
-                        (sensor_state, thermostat_state)
-                    {
-                        let heat_required = thermostat_state.heat_required;
-                        let heating_demand = thermostat_state.pi_heating_demand as f64 / 100.0; // scale to [0.0, 1.0]
-                        let sensor_temp = sensor_state.temperature;
-                        let setpoint = thermostat_state.occupied_heating_setpoint;
-
-                        let mut adjustment = 0.0;
-                        let demand_threshold = 0.75;
-                        if heating_demand > demand_threshold {
-                            // positive if we need to heat up
-                            adjustment = (setpoint - sensor_temp)
-                                * ((heating_demand - demand_threshold) / (1.0 - demand_threshold));
-                            if adjustment < 0.0 {
-                                adjustment = 0.0;
-                            }
-                            if adjustment > 2.0 {
-                                adjustment = 2.0;
-                            }
-                        }
-
-                        if !heat_required {
-                            adjustment = 0.0;
-                        }
-
-                        let fixed_hp_temp = 21.5 - 0.1; // TODO: get this from HP state
-                        let setting = format!("I10000={:.1}", fixed_hp_temp - adjustment);
-
-                        // publish to bsblan heating circuit 1
-                        client
-                            .publish("BSB-LAN", QoS::AtLeastOnce, false, setting)
-                            .await
-                            .unwrap();
-
-                        println!(
-                            "Setting flow temp adjustment for {} to {:.1}",
-                            room.name, adjustment
-                        );
-                    } else {
-                        println!(
-                            "Missing recent sensor or thermostat state for room {}, flow temp adjustment will not be set",
-                            room.name
-                        );
-                    }
-                }
-            }
-        }
-    });
-
     loop {
-        match event_loop.poll().await {
-            Ok(event) => match event {
-                rumqttc::Event::Incoming(rumqttc::Incoming::Publish(p)) => {
-                    let topic = p.topic.to_string();
-                    let payload_str = String::from_utf8(p.payload.to_vec()).unwrap();
+        let msg = rx.recv().await.unwrap();
 
-                    println!("Topic: {}, Payload: {}", topic, payload_str);
+        let asd = async move {
+            // check if the message is a sensor message or a thermostat message
+            let topic = msg.topic.clone();
+            let payload_str = String::from_utf8(msg.payload.to_vec());
 
-                    let device_id: Vec<&str> = topic.split('/').collect();
-                    if device_id.len() == 2 {
-                        let id = device_id[1].to_string();
-
-                        let mut state_tracker = state_tracker.write().await;
-                        state_tracker.update(id, payload_str.clone());
-                    }
-                }
-                _ => {}
-            },
-            Err(e) => {
-                eprintln!("Error in MQTT event loop: {:?}", e);
-                // Handle error as appropriate for your application
-            }
-        }
+            let device_id: Vec<&str> = topic.split('/').collect();
+        };
     }
+
+    // loop {
+    //     let event = event_loop.poll().await.unwrap_or_else(|e| {
+    //         error!("rumqqtc polling error: {:?}", e);
+    //     });
+
+    //     info!("processed event: {:?}", event);
+
+    //     match event {
+    //         rumqttc::Event::Incoming(rumqttc::Incoming::Publish(p)) => {
+    //             let topic = p.topic.to_string();
+    //             let payload_str = String::from_utf8(p.payload.to_vec()).unwrap();
+
+    //             println!("Topic: {}, Payload: {}", topic, payload_str);
+
+    //             let device_id: Vec<&str> = topic.split('/').collect();
+    //             if device_id.len() == 2 {
+    //                 let id = device_id[1].to_string();
+
+    //                 let mut state_tracker = state::StateTracker::new(pool.clone());
+    //                 state_tracker.update(id, payload_str.clone()).await;
+    //             }
+    //         }
+    //         _ => {}
+    //     }
+    // }
+
+    // loop {
+    //     match event_loop.poll().await {
+    //         Ok(event) => match event {
+    //             rumqttc::Event::Incoming(rumqttc::Incoming::Publish(p)) => {
+    //                 let topic = p.topic.to_string();
+    //                 let payload_str = String::from_utf8(p.payload.to_vec()).unwrap();
+
+    //                 println!("Topic: {}, Payload: {}", topic, payload_str);
+
+    //                 let device_id: Vec<&str> = topic.split('/').collect();
+    //                 if device_id.len() == 2 {
+    //                     let id = device_id[1].to_string();
+
+    //                     let mut state_tracker = state_tracker.write().await;
+    //                     state_tracker.update(id, payload_str.clone());
+    //                 }
+    //             }
+    //             _ => {}
+    //         },
+    //         Err(e) => {
+    //             eprintln!("Error in MQTT event loop: {:?}", e);
+    //             // Handle error as appropriate for your application
+    //         }
+    //     }
+    // }
 }
