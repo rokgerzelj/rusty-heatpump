@@ -112,6 +112,7 @@ async fn main() {
                 let state_reader = state_tracker.read().await;
 
                 // loop over rooms and check if we need to turn on/off the heating
+                // TODO: make this work for multiple rooms, currently each room will override the previous one's adjustment
                 for room in state_reader.config.rooms.iter() {
                     let sensor_state = state_reader.get_recent_sensor_state(&room.sensor.device_id);
                     let thermostat_state =
@@ -140,7 +141,8 @@ async fn main() {
                         }
 
                         if !heat_required {
-                            adjustment = 0.0;
+                            // this will turn off the heat pump completely
+                            adjustment = -50.0;
                         }
 
                         let fixed_hp_temp = 21.5 - 0.1; // TODO: get this from HP state
@@ -185,7 +187,7 @@ async fn main() {
                     }
                 }
                 rumqttc::Event::Incoming(rumqttc::Incoming::ConnAck(_ack)) => {
-                    // On reconnect we have to resubscribe to the topics, rumqtt does not do it by itself
+                    // On reconnect we have to resubscribe to the topics, rumqtt does not do it by
                     println!("CONNACK received, resubscribing to topics");
                     subscribe(&client, &config).await;
                 }
