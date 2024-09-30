@@ -4,6 +4,22 @@ use rumqttc::{AsyncClient, MqttOptions, QoS};
 use serde_json::json;
 use state::{Config, Room, Sensor, StateTracker, TRVTempControl, Thermostat};
 
+async fn subscribe(client: &AsyncClient, config: &Config) {
+    for id in config.sensor_ids() {
+        client
+            .subscribe(&format!("zigbee2mqtt/{}", id), QoS::AtLeastOnce)
+            .await
+            .unwrap();
+    }
+
+    for id in config.thermostat_ids() {
+        client
+            .subscribe(&format!("zigbee2mqtt/{}", id), QoS::AtLeastOnce)
+            .await
+            .unwrap();
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let config = Config {
@@ -26,21 +42,9 @@ async fn main() {
 
     let (client, mut event_loop) = AsyncClient::new(mqtt_options, 50);
 
-    for id in config.sensor_ids() {
-        client
-            .subscribe(&format!("zigbee2mqtt/{}", id), QoS::AtLeastOnce)
-            .await
-            .unwrap();
-    }
+    subscribe(&client, &config).await;
 
-    for id in config.thermostat_ids() {
-        client
-            .subscribe(&format!("zigbee2mqtt/{}", id), QoS::AtLeastOnce)
-            .await
-            .unwrap();
-    }
-
-    let state_tracker = StateTracker::new(config);
+    let state_tracker = StateTracker::new(config.clone());
 
     // TODO: try to "poke" the thermostats (and maybe sensors??) to get the state on startup
 
@@ -180,11 +184,16 @@ async fn main() {
                         state_tracker.update(id, payload_str.clone());
                     }
                 }
+                rumqttc::Event::Incoming(rumqttc::Incoming::ConnAck(_ack)) => {
+                    // On reconnect we have to resubscribe to the topics, rumqtt does not do it by itself
+                    println!("CONNACK received, resubscribing to topics");
+                    subscribe(&client, &config).await;
+                }
                 _ => {}
             },
             Err(e) => {
                 eprintln!("Error in MQTT event loop: {:?}", e);
-                // Handle error as appropriate for your application
+                // TODO: Handle error
             }
         }
     }
